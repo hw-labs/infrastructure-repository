@@ -1,0 +1,7 @@
+.*
+!.gitignore
+*data_bags/users/*
+!*.keep
+*.lock
+*.manifest
+cookbooks*

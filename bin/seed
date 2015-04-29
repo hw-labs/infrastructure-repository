@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+require 'bundler'
+
+Bundler.setup
+
+require 'bogo-ui'
+require 'fileutils'
+require 'openssl'
+require 'multi_json'
+require 'net/ssh'
+require 'miasma'
+require 'zip'
+require 'tempfile'
+require 'batali'
+
+ui = Bogo::Ui.new(:app_name => 'InfraRepo')
+root = File.expand_path(File.join(File.dirname(__FILE__), '..'))
+chef_dir = File.join(root, '.chef')
+cloud_creds = {}
+
+%w(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION).each do |env|
+  if(ENV[env])
+    cloud_creds[env.downcase.to_sym] = ENV[env]
+  else
+    ui.error "Missing required cloud credential environment variable: #{env}"
+    exit 1
+  end
+end
+
+seed_user = ui.ask('Username to add to Chef environment', :default => ENV['USER'])
+
+ui.info 'Starting the repository seed'
+ui.info "Cloud requirement setup... #{ui.color('started', :yellow)}"
+
+bucket_name = ui.ask('Cloud bucket name', :default => "infra_repo_#{seed_user}")
+
+cloud = Miasma.api(
+  :type => :storage,
+  :provider => :aws,
+  :credentials => cloud_creds
+)
+
+begin
+  bucket = cloud.buckets.get(bucket_name)
+rescue
+  # ignore
+end
+
+if(bucket)
+  ui.info "Infrastructure bucket... #{ui.color('available', :green)} (#{bucket_name})"
+else
+  bucket = cloud.buckets.build(:name => bucket_name)
+  bucket.save
+  ui.info "Infrastructure bucket... #{ui.color('created', :green)} (#{bucket_name})"
+end
+
+ui.info "Cloud requirement setup... #{ui.color('complete', :green)}"
+
+ui.info "Creating Chef configuration... #{ui.color('started', :yellow)}"
+
+FileUtils.mkdir_p(chef_dir)
+
+chef_key = OpenSSL::PKey::RSA.new(2048)
+
+File.open(File.join(chef_dir, 'client.pem'), 'w') do |file|
+  file.write chef_key.export
+end
+
+ui.info "Chef user client.pem file... #{ui.color('created', :green)}"
+
+ssh_key = OpenSSL::PKey::RSA.new(2048)
+
+File.open(File.join(chef_dir, 'id_rsa.infra'), 'w') do |file|
+  file.write ssh_key.export
+end
+FileUtils.chmod(0600, File.join(chef_dir, 'id_rsa.infra'))
+
+
+ui.info "Local user ssh key... #{ui.color('created', :green)}"
+
+File.open(File.join(chef_dir, 'knife.rb'), 'w') do |file|
+  file.puts <<-EOF
+current_dir = File.expand_path(File.dirname(__FILE__))
+root_dir = File.dirname(current_dir)
+
+log_level :info
+log_location STDOUT
+
+chef_server_url ENV['KNIFE_CHEF_SERVER_URL'].to_s
+chef_repo_path root_dir
+cookbook_path File.join(root_dir, 'cookbooks')
+
+node_name ENV.fetch('KNIFE_USER', '#{seed_user}')
+client_key ENV.fetch('KNIFE_CLIENT_KEY', '#{File.join(chef_dir, 'client.pem')}')
+
+# Encrypted data bag items
+knife[:secret_file] = ENV['SECRET_FILE']
+
+# AWS credentials
+knife[:aws_access_key_id] = ENV['AWS_ACCESS_KEY_ID']
+knife[:aws_secret_access_key] = ENV['AWS_SECRET_ACCESS_KEY']
+knife[:region] = ENV['AWS_REGION']
+
+# Cloudformation configuration
+knife[:cloudformation] = {}
+knife[:cloudformation][:processing] = true
+knife[:cloudformation][:options] = {}
+knife[:cloudformation][:options][:disable_rollback] = true
+knife[:cloudformation][:options][:capabilities] = ['CAPABILITY_IAM']
+knife[:cloudformation][:ssh_attempt_users] = ['ubuntu', '#{seed_user}']
+knife[:cloudformation][:identity_file] = ENV.fetch('DEFAULT_SSH_IDENTITY_FILE', '#{File.join(chef_dir, 'id_rsa.infra')}')
+knife[:cloudformation][:nesting_bucket] = '#{bucket_name}'
+knife[:cloudformation][:credentials] = {
+  :aws_access_key_id => knife[:aws_access_key_id],
+  :aws_secret_access_key => knife[:aws_secret_access_key],
+  :aws_region => knife[:region],
+  :aws_bucket_region => knife[:region]
+}
+
+EOF
+end
+
+ui.info "Chef knife config file... #{ui.color('created', :green)}"
+
+File.open('.sfn', 'w') do |file|
+  file.puts <<-EOF
+Configuration.new do
+  processing true
+  options do
+    on_failure 'rollback'
+    capabilities ['CAPABILITY_IAM']
+    tags do
+      creator '#{seed_user}'
+    end
+  end
+  ssh_attempt_users ['ubuntu', '#{seed_user}']
+  identity_file ENV['DEFAULT_SSH_IDENTITY_FILE']
+  nesting_bucket '#{bucket_name}'
+  credentials do
+    provider :aws
+    aws_access_key_id ENV['AWS_ACCESS_KEY_ID']
+    aws_secret_access_key ENV['AWS_SECRET_ACCESS_KEY']
+    aws_region ENV['AWS_REGION']
+    aws_bucket_region ENV['AWS_REGION']
+  end
+end
+EOF
+end
+
+ui.info "Sfn config file... #{ui.color('created', :green)}"
+
+File.open(File.join(root, 'data_bags', 'users', "#{seed_user}.json"), 'w+') do |file|
+  file.write MultiJson.dump({
+      :id => seed_user,
+      :groups => [
+        'sysadmins'
+      ],
+      :ssh_keys => [
+        [ssh_key.ssh_type, [ssh_key.to_blob].pack('m0')].join(' ')
+      ],
+      :chef_server => {
+        :client_key => chef_key.public_key.export,
+        :enabled => true
+      }
+    },
+    :pretty => true
+  )
+end
+
+ui.info "Seed user data bag item... #{ui.color('created', :green)}"
+ui.info "Chef configuration... #{ui.color('complete', :green)}"
+
+ui.info "Seeding bucket for initial bootstrap... #{ui.color('started', :yellow)}"
+
+Batali::Command::Update.new({:file => File.join(root, 'Batali')}, []).execute!
+
+file = Tempfile.new('infra')
+zip_path = file.path
+file.delete
+
+entries = Hash[
+  Dir.glob(File.join(root, '**', '*')).map do |path|
+    next if path.end_with?('.')
+    [path.sub(%r{#{Regexp.escape(root)}/?}, ''), path]
+  end
+]
+
+Zip::File.open(zip_path, Zip::File::CREATE) do |zipfile|
+  entries.keys.sort.each do |entry|
+    path = entries[entry]
+    if(File.directory?(path))
+      zipfile.mkdir(entry.dup)
+    else
+      zipfile.add(entry, path)
+    end
+  end
+end
+
+ui.info "Write stable asset to bucket... #{ui.color('writing', :yellow)}"
+
+stable = bucket.files.get('stable.zip') || bucket.files.build(:name => 'stable.zip')
+stable.body = File.open(zip_path, 'r')
+stable.save
+validator = bucket.files.get('validator.pem') || bucket.files.build(:name => 'validator.pem')
+validator.body = OpenSSL::PKey::RSA.new(2048).export
+validator.save
+
+File.delete(zip_path)
+
+ui.info "Seeding bucket for initial bootstrap... #{ui.color('complete', :green)}"
+
+ui.info "Seeding is now complete. Let it grow man, let it grow."
