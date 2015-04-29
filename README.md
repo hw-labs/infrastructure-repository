@@ -1,6 +1,6 @@
 # Infrastructure Repository
 
-> _An infrastructure repository is a discreet collection of provisioning
+> _An infrastructure repository is a discrete collection of provisioning
 and configuration resources that comprise a complete infrastructure set._
 
 This repository is a working example of an "infrastructure repository". For
